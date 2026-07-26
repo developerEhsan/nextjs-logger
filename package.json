@@ -43,6 +43,7 @@
   ],
   "scripts": {
     "build": "tsup src/index.ts src/provider/index.ts src/relay/route-handler.ts src/relay/server-action.ts --format esm --dts --out-dir dist --external next,react,react-dom --platform node",
+    "postbuild": "node scripts/check-edge-safety.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "changeset": "changeset"

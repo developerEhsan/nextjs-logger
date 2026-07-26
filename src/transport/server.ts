@@ -17,6 +17,7 @@
 
 import type { LogEntry, LogLevel, LogTransport } from '../core/types';
 import { sanitiseMessage, sanitiseData, redact } from '../security/index';
+import { getNodeStream } from '../utils/node-globals';
 
 // ─── ANSI colour palette ─────────────────────────────────────────────────────
 
@@ -93,11 +94,11 @@ function formatJson(entry: LogEntry, redactKeys: (string | RegExp)[]): string {
  * warn/error/fatal → stderr so they appear even when stdout is piped.
  * debug/info → stdout.
  */
-function getStream(level: LogLevel): NodeJS.WriteStream {
+function getStream(level: LogLevel): NodeJS.WriteStream | undefined {
   if (level === 'warn' || level === 'error' || level === 'fatal') {
-    return process.stderr;
+    return getNodeStream('stderr');
   }
-  return process.stdout;
+  return getNodeStream('stdout');
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -129,7 +130,7 @@ export function writeToTerminal(
       : formatJson(entry, redactKeys);
 
     const stream = getStream(entry.level);
-    stream.write(line + '\n');
+    stream?.write(line + '\n');
   } catch {
     // Swallow all transport errors — logging must never crash the app.
     // If even stderr is broken there's nothing meaningful we can do.

@@ -16,7 +16,7 @@
  *    location is always the *caller's* file, not logger internals.
  */
 
-import { cwd } from "process";
+import { getNodeCwd } from "./node-globals";
 
 const LIB_FRAME_MARKERS = [
   "/logger/",
@@ -52,10 +52,7 @@ export function getCallerLocation(): string | undefined {
     const raw = match[1]?.trim();
     if (!raw) continue;
     // Reduce to "relative/path/file.ts:line" for compact terminal output
-    const cwdPath =
-      typeof process !== "undefined" && typeof process.cwd === "function" ?
-        process.cwd()
-      : "";
+    const cwdPath = getNodeCwd() ?? "";
     const cleaned =
       raw?.startsWith(cwdPath) ? raw.slice(cwdPath.length + 1) : raw;
 

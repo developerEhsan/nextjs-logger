@@ -9,6 +9,7 @@
  */
 
 import type { LoggerConfig, PacerPolicy, LogLevel } from './types';
+import { getNodeBuffer } from '../utils/node-globals';
 
 // ─── Default redaction ────────────────────────────────────────────────────────
 
@@ -104,8 +105,9 @@ export const isEdgeRuntime = (): boolean =>
  * Falls back to `Buffer` when present since it's marginally cheaper on Node.
  */
 function toBase64Utf8(input: string): string {
-  if (typeof Buffer !== 'undefined') {
-    return Buffer.from(input, 'utf8').toString('base64');
+  const NodeBuffer = getNodeBuffer();
+  if (NodeBuffer) {
+    return NodeBuffer.from(input, 'utf8').toString('base64');
   }
   const bytes = new TextEncoder().encode(input);
   let binary = '';
