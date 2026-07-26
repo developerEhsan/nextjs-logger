@@ -1,0 +1,69 @@
+{
+  "name": "@developerehsan/nextjs-logger",
+  "version": "1.0.0",
+  "description": "A secure, terminal-only logging library for Next.js 16 with TanStack Pacer-backed client queueing. console.log DX, server-only output.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/developerEhsan/nextjs-logger.git"
+  },
+  "homepage": "https://github.com/developerEhsan/nextjs-logger#readme",
+  "bugs": {
+    "url": "https://github.com/developerEhsan/nextjs-logger/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./provider": {
+      "types": "./dist/provider/index.d.ts",
+      "import": "./dist/provider/index.js"
+    },
+    "./relay/route-handler": {
+      "types": "./dist/relay/route-handler.d.ts",
+      "import": "./dist/relay/route-handler.js"
+    },
+    "./relay/server-action": {
+      "types": "./dist/relay/server-action.d.ts",
+      "import": "./dist/relay/server-action.js"
+    }
+  },
+  "files": [
+    "dist",
+    "examples",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts src/provider/index.ts src/relay/route-handler.ts src/relay/server-action.ts --format esm --dts --out-dir dist --external next,react,react-dom --platform node",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "changeset": "changeset"
+  },
+  "peerDependencies": {
+    "next": ">=16.0.0",
+    "react": ">=19.0.0",
+    "react-dom": ">=19.0.0"
+  },
+  "dependencies": {
+    "@tanstack/pacer": "^0.5.0"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.31.1",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
