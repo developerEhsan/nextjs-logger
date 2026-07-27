@@ -1,6 +1,6 @@
 {
   "name": "@developerehsan/nextjs-logger",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A secure, terminal-only logging library for Next.js 16 with TanStack Pacer-backed client queueing. console.log DX, server-only output.",
   "license": "MIT",
   "repository": {
