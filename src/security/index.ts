@@ -101,6 +101,40 @@ export async function mintSessionToken(
   return sign(secret, buildSessionSigningInput(issuedAt));
 }
 
+/**
+ * Fraction of `SESSION_MAX_AGE_MS` after which a still-valid token should be
+ * proactively replaced.
+ */
+const SESSION_RENEW_AFTER = 0.5;
+
+/**
+ * Should the relay hand back a freshly minted token with this response?
+ *
+ * A token is minted once, when `LoggerProvider` renders, and then lives as
+ * long as the tab does. Nothing ever replaced it, so a tab left open past
+ * `SESSION_MAX_AGE_MS` (6h) started failing verification and every subsequent
+ * browser log was silently dropped — the same shape of quiet, delayed failure
+ * as the other bugs this library has shipped.
+ *
+ * Rolling renewal fixes it without adding an unauthenticated mint endpoint:
+ * you must already present a valid token to be given the next one, so this
+ * grants no capability a caller did not already have. An idle tab that misses
+ * the window entirely is caught by the Server Action fallback, which carries
+ * its own fresh token back.
+ */
+export function shouldRenewSession(issuedAt: string, now: number = Date.now()): boolean {
+  const age = now - new Date(issuedAt).getTime();
+  return Number.isFinite(age) && age > SESSION_MAX_AGE_MS * SESSION_RENEW_AFTER;
+}
+
+/** Mint a token for right now. Returns the pair the client must resend. */
+export async function mintFreshSession(
+  secret: string,
+): Promise<{ token: string; issuedAt: string }> {
+  const issuedAt = new Date().toISOString();
+  return { token: await mintSessionToken(secret, issuedAt), issuedAt };
+}
+
 // ─── Payload verification (server-side only) ──────────────────────────────────
 
 export class RelaySecurityError extends Error {
@@ -149,12 +183,37 @@ export function validateOrigin(
     );
   }
 
-  if (!allowedOrigins.includes(requestOrigin)) {
+  if (!isOriginAllowed(requestOrigin, allowedOrigins)) {
     throw new RelaySecurityError(
       `Origin "${requestOrigin}" is not in the allowed list.`,
       'INVALID_ORIGIN',
     );
   }
+}
+
+/**
+ * Exact match, plus support for the `scheme://host:*` any-port form that
+ * `buildAllowedOrigins()` emits for loopback in development.
+ *
+ * The wildcard is only ever a *port* wildcard on a host the allowlist named
+ * explicitly — it can never widen to another host, so a dev entry cannot
+ * accidentally admit `http://localhost.evil.com`.
+ */
+export function isOriginAllowed(requestOrigin: string, allowedOrigins: string[]): boolean {
+  for (const allowed of allowedOrigins) {
+    if (allowed === requestOrigin) return true;
+
+    if (allowed.endsWith(':*')) {
+      const prefix = allowed.slice(0, -1); // keep the trailing ':'
+      if (
+        requestOrigin.startsWith(prefix) &&
+        /^\d+$/.test(requestOrigin.slice(prefix.length))
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 /** Full server-side verification of a relay payload. */
@@ -244,26 +303,90 @@ export async function verifyPayload(
 
 // ─── Log injection sanitisation ───────────────────────────────────────────────
 
-/** Strip ANSI escape codes from a string. */
-const ANSI_ESCAPE_RE = /\x1B\[[0-9;]*[a-zA-Z]/g;
+/**
+ * Escape sequences a terminal will interpret.
+ *
+ * The previous pattern was `/\x1B\[[0-9;]*[a-zA-Z]/g`, which only covers CSI
+ * (`ESC [ … letter`). That leaves the other families through:
+ *   • OSC   — `ESC ] 0 ; text BEL` can rewrite the terminal's window title
+ *   • Fe    — `ESC c` is a full terminal reset
+ *   • nF    — `ESC ( B` and friends switch character sets
+ * All of them are reachable from a relayed log message, so match the families
+ * rather than just the common one.
+ */
+const ANSI_ESCAPE_RE =
+  // eslint-disable-next-line no-control-regex
+  /\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B]*(?:\x07|\x1B\\)?|[@-Z\\-_]|[ -/]*[0-~])/g;
 
-/** Strip dangerous characters that could corrupt terminal output or inject fake lines. */
+/**
+ * C0/C7 control characters, excluding `\t` (0x09), `\n` (0x0A) and `\r` (0x0D)
+ * — those are handled separately below so they can be *escaped* rather than
+ * silently deleted.
+ */
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHARS_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g;
+
+/**
+ * Neutralise anything in a caller-supplied string that could corrupt terminal
+ * output or forge log lines.
+ *
+ * Newlines are **escaped to a literal `\n`, not stripped**. The threat model at
+ * the top of this file has always claimed newline injection was blocked, but
+ * the original implementation only removed `\r` — so a relayed message
+ * containing a real `\n` could print a second, entirely attacker-controlled
+ * line that looked exactly like a genuine log entry:
+ *
+ *   log.info("ok\n01:02:03 [FATAL] database credentials rotated")
+ *
+ * Escaping rather than deleting keeps the information visible (you can still
+ * read what was sent) while making it impossible to fabricate a line prefix.
+ * Genuinely multi-line content belongs in `data`, where JSON encoding escapes
+ * it for the same reason.
+ */
 export function sanitiseMessage(raw: string): string {
   return raw
-    .replace(ANSI_ESCAPE_RE, '')         // strip ANSI escapes
-    .replace(/\r/g, '')                  // strip carriage returns
-    .replace(/\x00/g, '')               // strip null bytes
-    .slice(0, 4096);                     // hard message length cap
+    .replace(ANSI_ESCAPE_RE, '')          // terminal escape sequences
+    .replace(CONTROL_CHARS_RE, '')        // remaining control bytes (incl. lone ESC, NUL)
+    .replace(/\t/g, '  ')                 // tabs can fake column alignment
+    .replace(/\r\n|\r|\n/g, '\\n')        // escape — never forge a new line
+    .slice(0, 4096);                      // hard message length cap
 }
 
 /**
+ * Same neutralisation as `sanitiseMessage`, with a tighter cap, for the short
+ * `context` strings interpolated into a formatted line (namespace, caller,
+ * requestId, timestamp).
+ *
+ * These are just as attacker-influenced as `message` on the relay path —
+ * `verifyPayload` only checks that `context` is an object — but the terminal
+ * formatter used to interpolate them raw, so `namespace` was an unguarded
+ * second injection point that bypassed all the hardening above.
+ */
+export function sanitiseField(raw: string, maxLength = 256): string {
+  return sanitiseMessage(raw).slice(0, maxLength);
+}
+
+/**
+ * Keys that must never be carried through as own properties: assigning them
+ * while rebuilding an object can walk the prototype chain instead of creating
+ * a plain data property.
+ */
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
  * Deep-sanitise structured data by JSON round-tripping.
- * This rejects non-serialisable values (functions, undefined, circular refs)
- * and strips prototype pollution attempts.
+ *
+ * This rejects non-serialisable values (functions, `undefined`, circular refs)
+ * and drops prototype-polluting keys. The prototype part is not free: a bare
+ * `JSON.parse(JSON.stringify(x))` happily produces an object with an *own*
+ * `__proto__` key, which the docblock here used to claim was stripped. The
+ * reviver below actually does it.
  */
 export function sanitiseData(raw: unknown): unknown {
   try {
-    return JSON.parse(JSON.stringify(raw));
+    return JSON.parse(JSON.stringify(raw), function reviver(key, value) {
+      return UNSAFE_KEYS.has(key) ? undefined : value;
+    });
   } catch {
     return '[unserializable data]';
   }
@@ -293,7 +416,19 @@ export function redact(data: unknown, patterns: (string | RegExp)[]): unknown {
     if (value !== null && typeof value === 'object') {
       const out: Record<string, unknown> = {};
       for (const [key, val] of Object.entries(value)) {
-        out[key] = keyMatches(key, patterns) ? REDACTED : walk(val);
+        const next = keyMatches(key, patterns) ? REDACTED : walk(val);
+        // `out[key] = …` would hit the inherited `__proto__` setter for that
+        // key name, silently reparenting `out` instead of storing the value —
+        // so a `__proto__` field would vanish from the output rather than being
+        // redacted or printed. defineProperty always creates an own data
+        // property. (`sanitiseData` normally strips these first, but `redact`
+        // is exported and must be safe on its own.)
+        Object.defineProperty(out, key, {
+          value: next,
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
       }
       return out;
     }

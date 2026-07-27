@@ -40,7 +40,7 @@ export default function RootLayout({
           DevTools console (never your actual log content — that only ever
           goes to the terminal).
         */}
-        <LoggerProvider debug>{children}</LoggerProvider>
+        <LoggerProvider relayUrl="/api/log-relay" debug>{children}</LoggerProvider>
       </body>
     </html>
   );

@@ -10,6 +10,7 @@
 
 import type { LoggerConfig, PacerPolicy, LogLevel } from './types';
 import { getNodeBuffer } from '../utils/node-globals';
+import { levelRulesFromEnv } from './level-filter';
 
 // ─── Default redaction ────────────────────────────────────────────────────────
 
@@ -73,6 +74,16 @@ export const isServer = (): boolean =>
 /** Returns true when Next.js NODE_ENV is 'development'. */
 export const isDev = (): boolean =>
   process.env.NODE_ENV === 'development';
+
+/**
+ * Should bundled positions be resolved through source maps right now?
+ * Centralised so the caller-capture path and the stack-formatting path
+ * cannot disagree about it.
+ */
+export const sourceMapsEnabled = (cfg: { sourceMaps?: 'dev' | 'always' | 'off' }): boolean => {
+  const mode = cfg.sourceMaps ?? 'dev';
+  return mode === 'always' || (mode === 'dev' && isDev());
+};
 
 /** Returns true when running in the Edge Runtime (no Node.js built-ins). */
 export const isEdgeRuntime = (): boolean =>
@@ -175,17 +186,27 @@ export function buildAllowedOrigins(): string[] {
       .forEach((o) => origins.push(o));
   }
 
-  // In development, always allow localhost variants
+  // In development, allow loopback on ANY port.
+  //
+  // This used to be a hardcoded list of :3000/:3001. Next picks the next free
+  // port when 3000 is taken, and browsers do send `Origin` on cross-method
+  // POSTs to same-origin URLs — so the moment your dev server landed on :3002
+  // the relay started returning 403 and every browser log vanished, with the
+  // deliberately-generic error body giving no hint why. Enumerating ports
+  // cannot be right; the predicate below is.
   if (isDev()) {
-    origins.push(
-      'http://localhost:3000',
-      'http://localhost:3001',
-      'http://127.0.0.1:3000',
-    );
+    origins.push(...LOOPBACK_DEV_ORIGIN);
   }
 
   return [...new Set(origins)]; // deduplicate
 }
+
+/**
+ * Sentinel entry meaning "any loopback origin, any port". `isOriginAllowed`
+ * expands it; it is kept as a marker rather than a wildcard string so an
+ * allowlist printed in a debug log still reads honestly.
+ */
+export const LOOPBACK_DEV_ORIGIN = ['http://localhost:*', 'http://127.0.0.1:*'];
 
 // ─── Default config factory ───────────────────────────────────────────────────
 
@@ -198,6 +219,10 @@ export function buildDefaultConfig(
 ): LoggerConfig {
   const cfg: LoggerConfig = {
     minLevel: isDev() ? 'debug' : 'info',
+    // Read per-namespace rules from LOG_LEVEL unless the caller supplied
+    // their own. Env-driven, so a noisy namespace can be turned up on a
+    // running deployment without a code change.
+    levelRules: levelRulesFromEnv(),
     pacerPolicies: { ...DEFAULT_PACER_POLICIES, ...overrides.pacerPolicies },
     // Placeholder — replaced below by a lazy getter (or the override, if
     // one was given) so importing/creating a logger never eagerly derives
@@ -207,6 +232,18 @@ export function buildDefaultConfig(
     maxQueueSize: 500,
     prettyPrint: isDev(),
     allowedOrigins: buildAllowedOrigins(),
+    // 120 relay requests per 10 s per client key. A well-behaved client is
+    // Pacer-throttled to a small fraction of this even while logging hard, so
+    // the ceiling only bites on abuse. See LoggerConfig.relayRateLimit.
+    relayRateLimit: { limit: 120, windowMs: 10_000 },
+    // Stack capture on every server log is expensive; pay for it only where
+    // it's actually read. See LoggerConfig.captureCaller.
+    captureCaller: isDev(),
+    // Real filenames instead of chunk paths, in development. Opt into
+    // 'always' if your production build emits maps and you want them there
+    // too. See LoggerConfig.sourceMaps.
+    sourceMaps: 'dev',
+    captureGlobalErrors: true,
     ...overrides,
     // Merged rather than spread-overwritten so overrides *add* redact
     // patterns instead of silently disabling the sensible defaults.

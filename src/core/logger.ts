@@ -26,14 +26,25 @@ import {
   type LogEntry,
   type LoggerConfig,
   type LogMethod,
+  type SerializedError,
+  type TimerHandle,
   LOG_LEVEL,
 } from './types';
-import { buildDefaultConfig, isServer, isEdgeRuntime } from './config';
+import { buildDefaultConfig, isServer, isEdgeRuntime, sourceMapsEnabled, isDev } from './config';
+import { isErrorLike, serializeError, errorSummary, normalizeErrorsDeep } from './errors';
+import { isLevelEnabled } from './level-filter';
+import { applySchemaValidation, hasSchemas } from './schema';
+import {
+  startTimer,
+  endTimer,
+  createTimerHandle,
+  _setDefaultLogger,
+} from './timing';
 import { writeToTerminal } from '../transport/server';
 import { getCallerLocation } from '../utils/caller';
-import { getCurrentRequestId } from '../utils/request-context';
+import { getCurrentRequestId, getCurrentTraceIds } from '../utils/request-context';
 import { getOrCreateClientQueue, type ClientQueueOptions } from '../queue/client-queue';
-import type { ClientTransportOptions } from '../transport/client';
+import type { ClientTransportOptions, ServerActionRelay } from '../transport/client';
 
 // ─── Module-level sequence counter (server side) ─────────────────────────────
 
@@ -56,7 +67,7 @@ interface ClientBootstrap {
   relayUrl: string;
   signedToken: string;
   issuedAt: string;
-  serverAction?: (entries: LogEntry[]) => Promise<void>;
+  serverAction?: ServerActionRelay;
   debug: boolean;
 }
 
@@ -131,32 +142,139 @@ function buildClientQueueOptions(cfg: LoggerConfig): ClientQueueOptions {
 
 // ─── Entry construction ────────────────────────────────────────────────────────
 
+/**
+ * Work out what the caller meant, given that both arguments are `unknown`.
+ *
+ * Four shapes are supported, and all four occur constantly in real code:
+ *
+ *   log.error(err)                          → error, message from the error
+ *   log.error('checkout failed', err)       → error, caller's message
+ *   log.error('checkout failed', { error: err, orderId })
+ *                                           → error hoisted out of data
+ *   log.info('hello', { userId })           → no error, unchanged behaviour
+ *
+ * The third form matters more than it looks: it is what `withLogging()`
+ * emits, and it is the shape people write by hand when they want the error
+ * alongside other context. Hoisting `data.error` means that call gets the
+ * same first-class stack rendering as `log.error(err)` instead of a
+ * serialised blob buried in the data object.
+ *
+ * Anything left in `data` still gets a deep pass so that errors nested
+ * further down (`{ results: [{ err }] }`) serialise properly too — that
+ * walk short-circuits and returns the original reference when there is
+ * nothing to rewrite, so the common error-free path is free.
+ */
+function normalizeArgs(
+  rawMessage: unknown,
+  rawData: unknown,
+): { message: string; data: unknown; error?: SerializedError } {
+  // ① An error as the message.
+  if (isErrorLike(rawMessage)) {
+    const error = serializeError(rawMessage);
+    return {
+      message: errorSummary(error),
+      data: rawData === undefined ? undefined : normalizeErrorsDeep(rawData),
+      error,
+    };
+  }
+
+  const message = typeof rawMessage === 'string' ? rawMessage : stringifyMessage(rawMessage);
+
+  // ② An error as the data argument.
+  if (isErrorLike(rawData)) {
+    return { message, data: undefined, error: serializeError(rawData) };
+  }
+
+  // ③ An error under `data.error`.
+  if (
+    typeof rawData === 'object' &&
+    rawData !== null &&
+    !Array.isArray(rawData) &&
+    isErrorLike((rawData as { error?: unknown }).error)
+  ) {
+    const { error, ...rest } = rawData as { error: unknown } & Record<string, unknown>;
+    const remaining = Object.keys(rest).length > 0 ? normalizeErrorsDeep(rest) : undefined;
+    return { message, data: remaining, error: serializeError(error) };
+  }
+
+  // ④ Ordinary data.
+  return {
+    message,
+    data: rawData === undefined ? undefined : normalizeErrorsDeep(rawData),
+  };
+}
+
+/**
+ * Render a non-string, non-Error first argument. `console.log(obj)` prints
+ * the object, so accepting one here and stringifying is the least
+ * surprising behaviour; the alternative (`"[object Object]"`) is the
+ * classic logging papercut.
+ */
+function stringifyMessage(value: unknown): string {
+  if (value === undefined) return 'undefined';
+  if (value === null) return 'null';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'object') {
+    try {
+      return JSON.stringify(value) ?? String(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
 function buildEntry(
   level: LogLevel,
   message: string,
   data: unknown,
+  error: SerializedError | undefined,
   namespace: string | undefined,
+  cfg: LoggerConfig,
 ): LogEntry {
-  const runtime: 'server' | 'client' = isServer() ? 'server' : 'client';
+  const onServer = isServer();
+  const runtime: 'server' | 'client' = onServer ? 'server' : 'client';
+  // Server-side only: the browser has no trace context to read, and the
+  // relayed entry inherits correlation from the relay request itself.
+  const trace = onServer ? getCurrentTraceIds() : undefined;
 
   return {
     level,
     message,
     data,
+    error,
     context: {
       runtime,
       timestamp: new Date().toISOString(),
-      sequence: isServer() ? serverSequence++ : 0, // client assigns its own sequence in the queue
-      caller: isServer() ? getCallerLocation() : undefined,
+      sequence: onServer ? serverSequence++ : 0, // client assigns its own sequence in the queue
+      // Gated on config: the stack capture behind this is expensive enough
+      // that it should not run on every production log line.
+      caller:
+        onServer && cfg.captureCaller
+          ? getCallerLocation({ sourceMaps: sourceMapsEnabled(cfg) })
+          : undefined,
       namespace,
-      requestId: isServer() ? getCurrentRequestId() : undefined,
+      requestId: onServer ? getCurrentRequestId() : undefined,
+      traceId: trace?.traceId,
+      spanId: trace?.spanId,
     },
   };
 }
 
 // ─── Dispatch ──────────────────────────────────────────────────────────────────
 
-function shouldLog(level: LogLevel, cfg: LoggerConfig): boolean {
+/**
+ * The level gate.
+ *
+ * `cfg.minLevel` is the floor; `cfg.levelRules` (from `LOG_LEVEL`, or set
+ * directly) can raise or lower it for a matching namespace, or silence the
+ * namespace entirely. Resolution is memoised per namespace inside
+ * `level-filter.ts`, so the common no-rules case costs one property read.
+ */
+function shouldLog(level: LogLevel, namespace: string | undefined, cfg: LoggerConfig): boolean {
+  if (cfg.levelRules?.length) {
+    return isLevelEnabled(level, namespace, cfg.levelRules, cfg.minLevel);
+  }
   return LOG_LEVEL[level] >= LOG_LEVEL[cfg.minLevel];
 }
 
@@ -169,18 +287,27 @@ function isSampledOut(level: LogLevel, cfg: LoggerConfig): boolean {
 
 function dispatch(
   level: LogLevel,
-  message: string,
-  data: unknown,
+  rawMessage: unknown,
+  rawData: unknown,
   namespace: string | undefined,
   cfg: LoggerConfig,
 ): void {
   // Fast exits for filtered/sampled-out levels — avoid all downstream work.
-  if (!shouldLog(level, cfg)) return;
+  // Both gates run before `normalizeArgs`, so a filtered-out level never
+  // pays for error serialisation or the deep data walk.
+  if (!shouldLog(level, namespace, cfg)) return;
   if (isSampledOut(level, cfg)) return;
 
   // Defensive: never let a logging call throw and break the caller's code.
   try {
-    const entry = buildEntry(level, message, data, namespace);
+    const { message, data, error } = normalizeArgs(rawMessage, rawData);
+    let entry = buildEntry(level, message, data, error, namespace, cfg);
+
+    // Optional per-namespace `data` validation. Gated on there being any
+    // schema registered at all, so an app that never calls
+    // `registerSchema()` pays one boolean check. A violation annotates the
+    // entry; it never suppresses it — see `core/schema.ts`.
+    if (hasSchemas()) entry = applySchemaValidation(entry, isDev());
 
     if (isServer()) {
       // Server (Node.js or Edge): write straight to the terminal.
@@ -194,6 +321,7 @@ function dispatch(
         prettyPrint: cfg.prettyPrint,
         redactKeys: cfg.redactKeys,
         transports: cfg.transports,
+        resolveSourceMaps: sourceMapsEnabled(cfg),
       });
     } else {
       // Client (browser): enqueue. If not yet initialised, buffer briefly.
@@ -216,9 +344,27 @@ function dispatch(
 // ─── Public factory ────────────────────────────────────────────────────────────
 
 function makeLogMethod(level: LogLevel, namespace: string | undefined, getCfg: () => LoggerConfig): LogMethod {
-  return (message: string, data?: unknown) => {
+  return (message: unknown, data?: unknown) => {
     dispatch(level, message, data, namespace, getCfg());
   };
+}
+
+/**
+ * Attach the measured duration to the entry's structured data as well as
+ * its message.
+ *
+ * The message (`"db.query: 42.1ms"`) is for the human reading the terminal;
+ * `data.durationMs` is for everything else — a transport shipping to a log
+ * aggregator, a `jq` pipeline, an alert on p99. Putting it only in the
+ * message would make timings unqueryable, which defeats most of the reason
+ * to log them.
+ */
+function withDuration(data: unknown, durationMs: number): unknown {
+  if (data === undefined) return { durationMs };
+  if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
+    return { ...(data as Record<string, unknown>), durationMs };
+  }
+  return { durationMs, data };
 }
 
 /**
@@ -250,6 +396,53 @@ function buildLoggerObject(namespace: string | undefined, getCfg: () => LoggerCo
     warn: makeLogMethod('warn', namespace, getCfg),
     error: makeLogMethod('error', namespace, getCfg),
     fatal: makeLogMethod('fatal', namespace, getCfg),
+
+    assert: (condition: unknown, message?: unknown, data?: unknown) => {
+      if (condition) return;
+      dispatch(
+        'error',
+        message === undefined ? 'Assertion failed' : message,
+        data,
+        namespace,
+        getCfg(),
+      );
+    },
+
+    time: (label: string) => {
+      startTimer(namespace, label, (warning) =>
+        dispatch('warn', warning, undefined, namespace, getCfg()),
+      );
+    },
+
+    timeEnd: (label: string, data?: unknown): number | undefined => {
+      const durationMs = endTimer(namespace, label);
+      if (durationMs === undefined) {
+        // Matches `console.timeEnd`'s behaviour of warning rather than
+        // silently doing nothing — a mistyped label is otherwise invisible.
+        dispatch(
+          'warn',
+          `Timer "${label}" does not exist.`,
+          undefined,
+          namespace,
+          getCfg(),
+        );
+        return undefined;
+      }
+      dispatch(
+        'debug',
+        `${label}: ${durationMs}ms`,
+        withDuration(data, durationMs),
+        namespace,
+        getCfg(),
+      );
+      return durationMs;
+    },
+
+    timer: (label: string, level: LogLevel = 'debug'): TimerHandle =>
+      createTimerHandle(label, (message, data, durationMs) => {
+        dispatch(level, message, withDuration(data, durationMs), namespace, getCfg());
+      }),
+
     flush: async () => {
       if (!isServer() && clientBootstrap) {
         const queue = getOrCreateClientQueue(buildClientQueueOptions(getCfg()));
@@ -271,6 +464,12 @@ function buildLoggerObject(namespace: string | undefined, getCfg: () => LoggerCo
  * `import { log } from '@developerehsan/nextjs-logger'` then `log.info(...)`.
  */
 export const log: Logger = buildLoggerObject(undefined, () => globalConfig);
+
+// `withLogging()` needs a default logger but cannot import one: `timing.ts`
+// is imported *by* this module, so a back-import would be a cycle and would
+// leave `log` undefined at the moment a consumer evaluates `withLogging()`
+// at their own module scope. Inject it instead, now that `log` exists.
+_setDefaultLogger(log);
 
 /** Exposed for advanced consumers who need raw environment checks. */
 export { isServer, isEdgeRuntime };

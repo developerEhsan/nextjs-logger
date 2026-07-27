@@ -28,10 +28,14 @@
 
 'use server';
 
-import type { LogEntry } from '../core/types';
+import type { LogEntry, RelayResponse } from '../core/types';
 import { writeBatchToTerminal } from '../transport/server';
 import { getConfig } from '../core/logger';
-import { sanitiseData } from '../security/index';
+import { sanitiseData, mintFreshSession } from '../security/index';
+// `sourceMapsEnabled` is a pure predicate over config, so it is safe for
+// this no-splitting island to inline a copy of — unlike `core/logger`,
+// which owns mutable state and is therefore marked external in the build.
+import { sourceMapsEnabled } from '../core/config';
 
 const MAX_ENTRIES_PER_CALL = 100;
 const VALID_LEVELS = new Set(['debug', 'info', 'warn', 'error', 'fatal']);
@@ -49,7 +53,7 @@ function debugLog(message: string): void {
  * itself rendered, which is a strictly stronger guarantee than a public
  * HTTP endpoint.
  */
-export async function relayLogEntries(entries: LogEntry[]): Promise<void> {
+export async function relayLogEntries(entries: LogEntry[]): Promise<RelayResponse> {
   // Read lazily (not at module scope) via the shared accessor in
   // core/logger.ts so this stays in sync with `configureLogger()` and
   // with the API route handler — see the note there for why building an
@@ -86,6 +90,17 @@ export async function relayLogEntries(entries: LogEntry[]): Promise<void> {
       prettyPrint: config.prettyPrint,
       redactKeys: config.redactKeys,
       transports: config.transports,
+      resolveSourceMaps: sourceMapsEnabled(config),
     });
   }
+
+  // Hand back a fresh session. The client reaches this action either because
+  // no route handler is mounted, or because its token aged out — in the
+  // latter case this is what gets it back onto the cheap fetch transport
+  // instead of paying the router-dispatch cost on every batch forever.
+  //
+  // Safe to mint unconditionally here: Next only lets an action reference be
+  // invoked from a page this server rendered, so reaching this line already
+  // proves at least as much as presenting a token would.
+  return { ok: true, session: await mintFreshSession(config.relaySecret) };
 }
