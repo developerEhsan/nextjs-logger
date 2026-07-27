@@ -10,4 +10,6 @@
 
 export { LoggerProvider } from './LoggerProvider';
 export type { LoggerProviderProps } from './LoggerProvider';
-export { useLogger } from './useLogger';
+// Re-exported through the `'use client'` island so the hook keeps its client
+// boundary in the build output — see the header of ./client.ts.
+export { useLogger } from './client';

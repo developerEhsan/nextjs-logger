@@ -85,14 +85,21 @@ token on the server and threads it down to a 1-line Client Component that
 bootstraps the relay transport — synchronously, during render, before any
 descendant component mounts. You never touch this again.
 
-### 3.2 Create the relay API route (fallback transport)
+### 3.2 Create the relay API route (the default transport)
 
 ```ts
-// app/api/__log/route.ts
+// app/api/log-relay/route.ts
 export { POST } from '@developerehsan/nextjs-logger/relay/route-handler';
 ```
 
 That's the entire file. All verification logic lives inside the package.
+
+> **Do not rename this folder to something starting with an underscore.**
+> Next.js treats `_folder` as a [private folder](https://nextjs.org/docs/app/getting-started/project-structure#private-folders)
+> and excludes it from routing entirely, so the handler would never be mounted
+> and the relay would silently fall back to the slower Server Action transport.
+> If you pass a custom `relayUrl`, the provider warns in development when it
+> spots an underscore-prefixed segment.
 
 ### 3.3 (Optional but recommended) Request correlation via `proxy.ts`
 
@@ -154,6 +161,132 @@ export default async function Page() {
 }
 ```
 
+### Errors
+
+Pass the error itself. `Error`'s fields are non-enumerable, so a logger that
+just `JSON.stringify`s it prints `{}` — this one serialises `message`,
+`name`, the stack, the `cause` chain, `AggregateError.errors`, and own
+extras like `code`, `statusCode` and Next.js's `digest`.
+
+```ts
+try {
+  await chargeCard(order);
+} catch (err) {
+  log.error(err);                                  // message + full stack
+  log.error('checkout failed', err);               // your message, full stack
+  log.error('checkout failed', { orderId, error: err }); // hoisted, same result
+}
+```
+
+```
+10:23:45.123 [ERROR] StripeCardError: Your card was declined
+  StripeCardError: Your card was declined
+    at chargeCard (app/lib/payments.ts:42:11)
+    at Checkout (app/checkout/page.tsx:18:5)
+    props: {"code":"card_declined","statusCode":402}
+  caused by:
+    Error: connect ECONNREFUSED 10.0.0.4:443
+      at TCPConnectWrap.afterConnect (node:net:1607:16)
+```
+
+Errors nested inside `data` are serialised too, at any depth. A thrown
+non-`Error` (`throw 'boom'`, a rejected promise with a string reason) is
+handled rather than dropped.
+
+Every log method accepts `unknown` as its first argument specifically so
+`catch (err)` — which TypeScript types as `unknown` — needs no cast.
+
+### Uncaught errors, automatically
+
+Uncaught browser errors and unhandled rejections reach the terminal with no
+call site at all — `<LoggerProvider>` installs `window.onerror` and
+`unhandledrejection` handlers (additively; your other error reporters and
+the browser console still see everything). Disable with
+`captureGlobalErrors={false}`.
+
+For the server side, wire up `instrumentation.ts`:
+
+```ts
+// instrumentation.ts (project root)
+export { onRequestError } from '@developerehsan/nextjs-logger/instrumentation';
+
+export async function register() {
+  const { registerProcessErrorHandlers } = await import(
+    '@developerehsan/nextjs-logger/instrumentation'
+  );
+  registerProcessErrorHandlers();
+}
+```
+
+`onRequestError` is the Next.js hook that fires for every server-side error
+the framework catches — thrown Server Components, failed Server Actions,
+rejected Route Handlers, and errors surfaced mid-stream, which are otherwise
+the hardest class to see because the response has already started.
+
+### Timings
+
+```ts
+const t = log.timer('db.query');
+const rows = await db.select();
+t.end({ rows: rows.length });     // → "db.query: 42.1ms"  + data.durationMs
+```
+
+`log.time(label)` / `log.timeEnd(label)` exist for `console` parity, but
+they key timers by label in module state — **use `log.timer()` on the
+server**, where two concurrent requests sharing a label would corrupt each
+other's measurement.
+
+To time a whole function, including its failures:
+
+```ts
+import { withLogging } from '@developerehsan/nextjs-logger';
+
+export const createOrder = withLogging(
+  async (formData: FormData) => { /* … */ },
+  { name: 'createOrder' },
+);
+```
+
+```
+→ createOrder
+✓ createOrder                       { "durationMs": 128.4 }
+✗ createOrder                       { "durationMs": 91.2 }  + full error/stack
+```
+
+The wrapper is transparent: the original error is re-thrown unwrapped, a
+sync function stays sync, and `this` is forwarded. Arguments and return
+values are **not** logged unless you pass `logArgs`/`logResult` — positional
+arguments can't be reached by `redactKeys`, which matches object keys.
+
+### Assertions
+
+```ts
+log.assert(cart.total >= 0, 'cart total went negative', { cartId });
+```
+
+Logs at `error` level only when the condition is falsy.
+
+### Real filenames instead of chunk paths
+
+Stack frames and the `caller` field are resolved through your build's source
+maps, so you get `app/checkout/form.tsx:42:9` rather than
+`/_next/static/chunks/page.js:2:48219`. This applies to relayed browser
+stacks (where it matters most — those frames are minified) and to the
+`caller` field, which otherwise degrades to a Turbopack chunk path.
+
+On in development by default. For production, emit maps and opt in:
+
+```ts
+// next.config.ts
+export default { productionBrowserSourceMaps: true };
+```
+```ts
+configureLogger({ sourceMaps: 'always' });   // 'dev' | 'always' | 'off'
+```
+
+Resolution is best-effort and cached per chunk: a missing or unparseable map
+leaves the generated location untouched rather than failing the log.
+
 ### Namespacing
 
 ```ts
@@ -194,8 +327,9 @@ ClientQueue.enqueue()
    │  (per-level TanStack Pacer:
    │   throttle / debounce / rateLimit)
    ▼
-flush() ──── Server Action (preferred) ──────► relayLogEntries()
-       └──── API route (fallback) ──────────► POST /api/__log
+flush() ──── API route (default) ────────────► POST /api/log-relay
+       └──── Server Action (fallback, only ──► relayLogEntries()
+             if the route handler is absent)
                                                      │
                                           HMAC verify, origin check,
                                           replay-window check,
@@ -309,6 +443,10 @@ interface LoggerConfig {
   redactKeys: (string | RegExp)[]; // default: password/token/secret/... — see below
   sampleRate?: Partial<Record<LogLevel, number>>; // e.g. { debug: 0.1 } keeps ~10%
   transports?: LogTransport[];   // extra sinks, e.g. Sentry/Datadog — see below
+  captureCaller: boolean;        // default: true in dev — file:line per entry
+  sourceMaps: 'dev'|'always'|'off'; // default: 'dev' — real filenames, see above
+  captureGlobalErrors: boolean;  // default: true — window.onerror capture
+  relayRateLimit: RateLimitPolicy | false; // default: 120 req / 10 s per client
 }
 ```
 
@@ -346,6 +484,49 @@ configureLogger({ sampleRate: { debug: 0.1 } }); // keep ~10% of debug calls
 Omit a level (or the whole map) to log everything at that level — this is
 independent of, and evaluated before, `minLevel`/Pacer filtering.
 
+### Runtime level control per namespace
+
+```bash
+LOG_LEVEL='info:*,debug:checkout,-checkout:polling'
+```
+
+Info everywhere, debug under `checkout`, and nothing at all from
+`checkout:polling`. The `debug`-package syntax you already know: `*`
+wildcards, comma separation, `-` to silence. **The last matching rule
+wins**, so read it left-to-right as "general default, then exceptions".
+Exact patterns match their children (`checkout` covers `checkout:payment`).
+
+Build the same rules in code with `parseLevelSpec()` and
+`configureLogger({ levelRules })`.
+
+### Trace correlation (OpenTelemetry / W3C)
+
+Every server-side entry carries `traceId`/`spanId` when a trace context is
+available, from either an active OpenTelemetry span or the inbound
+`traceparent` header. This is what makes these log lines joinable with the
+traces your gateway or vendor already produces — `requestId` stops at the
+process boundary; a trace ID does not.
+
+With an OTel SDK installed there is nothing to do. Without one, pick the
+header up in your proxy:
+
+```ts
+// proxy.ts
+import { runWithRequestContext, generateRequestId, traceContextFromHeaders }
+  from '@developerehsan/nextjs-logger';
+
+export default function proxy(request: Request) {
+  return runWithRequestContext(
+    generateRequestId(),
+    () => handle(request),
+    traceContextFromHeaders(request.headers),
+  );
+}
+```
+
+The pretty terminal format prints the first 8 characters (`trace:4bf92f35`);
+JSON output and every transport carry the full IDs.
+
 ### Pluggable transports (server-side)
 
 ```ts
@@ -364,6 +545,87 @@ Transports receive every entry that's actually written (after
 sampling/level filtering) and run alongside the terminal write, each
 isolated in its own `try/catch` — a throwing transport can never suppress
 terminal output or crash another transport.
+
+**For network sinks, use the batched form** and the shipped adapters, which
+add batching, retry with jittered backoff, bounded buffers and drop
+accounting:
+
+```ts
+import { configureLogger } from '@developerehsan/nextjs-logger';
+import {
+  fileTransport, datadogTransport, axiomTransport,
+  betterStackTransport, otlpTransport, pinoTransport,
+} from '@developerehsan/nextjs-logger/transports';
+
+configureLogger({
+  transports: [
+    fileTransport({ path: './logs/app.log', maxSizeBytes: 10_000_000, maxFiles: 5 }),
+    datadogTransport({ apiKey: process.env.DD_API_KEY!, minLevel: 'warn' }),
+    otlpTransport({ url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT! }),
+  ],
+});
+```
+
+| Adapter | Notes |
+|---|---|
+| `fileTransport` | Size-based rotation. Synchronous appends, so the last lines survive a crash |
+| `httpTransport` | Generic batching POST — build your own vendor on it |
+| `datadogTransport` / `axiomTransport` / `betterStackTransport` | Presets over `httpTransport` |
+| `otlpTransport` | OTLP/HTTP+JSON logs, with trace IDs in the LogRecord's own fields |
+| `pinoTransport` / `winstonTransport` | Forward into an existing Pino/Winston pipeline |
+
+Write your own with `{ name, write(entries) }`. **Throwing means "retry
+me"** — throw for a network blip or a 5xx, return for a payload the remote
+will never accept.
+
+> **On serverless, `await flushTransports()` before returning.** Batching
+> and freeze-on-response are fundamentally in tension: the platform can
+> suspend the instance the moment the response is sent, with a batch still
+> buffered. The default flush interval is 2s to bound the loss if you
+> forget, but only you know when a request is done.
+
+`getTransportStats()` reports `written` / `retried` / `dropped` / `pending`
+per transport — drops are counted, never silent.
+
+### Fleet-wide relay rate limiting
+
+The built-in relay cap is in-memory, so on serverless it limits each warm
+instance rather than the deployment. For a shared counter:
+
+```ts
+import { createRedisRateLimiter, upstashRedisClient }
+  from '@developerehsan/nextjs-logger/security/rate-limit-redis';
+
+const client = upstashRedisClient(); // reads UPSTASH_REDIS_REST_* ; null if unset
+if (client) configureLogger({ relayRateLimitAsync: createRedisRateLimiter(client) });
+```
+
+Any Redis works — `ioredis`, `node-redis` and `@upstash/redis` all satisfy
+the `RedisClient` interface. Both limits apply, and the shared one **fails
+open**: a Redis outage must not silently delete every browser log.
+
+### Log data schemas
+
+Keep structured logs queryable by validating `data` per namespace, with any
+[Standard Schema](https://standardschema.dev) validator (Zod 3.24+, Valibot,
+ArkType) or a plain predicate:
+
+```ts
+import { registerSchema } from '@developerehsan/nextjs-logger';
+import { z } from 'zod';
+
+registerSchema('checkout', z.object({
+  orderId: z.string(),
+  amountCents: z.number().int(),
+}));
+
+log.child('checkout').info('order placed', { order_id: 'o_1' });
+// ⚠ warns in dev: orderId: expected string — and logs the entry anyway
+```
+
+A violation **never suppresses the log line**; it warns in development and
+annotates the entry with `data.__schemaError` in production. The one thing
+worse than an inconsistently-shaped log is a missing one.
 
 ### `useLogger()` (optional React hook)
 
@@ -388,6 +650,8 @@ Environment variables:
 | `NEXT_PUBLIC_APP_URL` | Recommended | Seeds the origin allowlist (never used as a secret fallback — it's public) |
 | `LOGGER_ALLOWED_ORIGINS` | Optional | Comma-separated extra allowed origins |
 | `LOGGER_DEBUG_RELAY` | Optional | Set to `1` to log *why* the relay endpoint rejected a request, server-side only |
+| `LOG_LEVEL` | Optional | Per-namespace levels, e.g. `info:*,debug:checkout,-checkout:polling` |
+| `UPSTASH_REDIS_REST_URL` / `_TOKEN` | Optional | Read by `upstashRedisClient()` for the fleet-wide relay cap |
 
 ---
 

@@ -1,5 +1,5 @@
 /**
- * @file app/api/__log/route.ts
+ * @file app/api/log-relay/route.ts
  * The relay fallback transport (used automatically if the Server Action
  * path isn't available, or as a retry fallback after 3 failed Server
  * Action attempts). Every defensive check — session-token verification,

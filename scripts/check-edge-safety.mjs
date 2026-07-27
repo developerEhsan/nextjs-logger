@@ -29,6 +29,17 @@ const FORBIDDEN_PATTERNS = [
   { name: 'process.cwd(', re: /\bprocess\.cwd\s*\(/ },
   { name: 'Buffer.from(', re: /\bBuffer\.from\s*\(/ },
   { name: 'require(', re: /\brequire\s*\(\s*['"]/ },
+  // A resolvable `node:` specifier — static or dynamic. `utils/source-map.ts`
+  // needs `node:fs` for synchronous map reads, and reaches it two ways that
+  // are both invisible to a bundler: `process.getBuiltinModule('node:fs')`
+  // (a plain function argument, matched by neither pattern below) and a
+  // dynamic import whose specifier is assembled at runtime. Both patterns
+  // exist because `'node:' + 'fs'` is constant-folded by esbuild — if
+  // someone "simplifies" the runtime assembly back to a literal, the
+  // specifier becomes resolvable again and Next's Edge bundler starts
+  // flagging it in any consumer chunk that reaches this module.
+  { name: 'static node: import', re: /\bfrom\s*['"]node:/ },
+  { name: 'literal node: dynamic import', re: /\bimport\s*\(\s*['"]node:/ },
 ];
 
 function walk(dir) {

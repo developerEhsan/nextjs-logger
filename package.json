@@ -27,6 +27,18 @@
       "types": "./dist/provider/index.d.ts",
       "import": "./dist/provider/index.js"
     },
+    "./transports": {
+      "types": "./dist/transports/index.d.ts",
+      "import": "./dist/transports/index.js"
+    },
+    "./security/rate-limit-redis": {
+      "types": "./dist/security/rate-limit-redis.d.ts",
+      "import": "./dist/security/rate-limit-redis.js"
+    },
+    "./instrumentation": {
+      "types": "./dist/instrumentation/index.d.ts",
+      "import": "./dist/instrumentation/index.js"
+    },
     "./relay/route-handler": {
       "types": "./dist/relay/route-handler.d.ts",
       "import": "./dist/relay/route-handler.js"
@@ -38,12 +50,13 @@
   },
   "files": [
     "dist",
-    "examples",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
-    "build": "tsup src/index.ts src/provider/index.ts src/relay/route-handler.ts src/relay/server-action.ts --format esm --dts --out-dir dist --external next,react,react-dom --platform node",
-    "postbuild": "node scripts/check-edge-safety.mjs",
+    "prebuild": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "tsup",
+    "postbuild": "node scripts/check-edge-safety.mjs && node scripts/check-build-contract.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "changeset": "changeset"

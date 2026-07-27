@@ -34,18 +34,29 @@
  * body, only using a microtask click-through for cleanup wiring.
  */
 
-import * as React from 'react';
-import { mintSessionToken as signSessionToken } from '../security/index';
-import { getConfig } from '../core/logger';
-import { LoggerBootstrapClient } from './LoggerBootstrapClient';
-import { relayLogEntries } from '../relay/server-action';
+import * as React from "react";
+import { mintSessionToken as signSessionToken } from "../security/index";
+import { getConfig } from "../core/logger";
+// Imported through the `'use client'` island barrel (NOT directly from
+// './LoggerBootstrapClient'). That indirection is what carries the client
+// boundary into the build output — see the header of ./client.ts.
+import { LoggerBootstrapClient } from "./client";
+import { relayLogEntries } from "../relay/server-action";
 
 export interface LoggerProviderProps {
   children: React.ReactNode;
-  /** Override the relay API route path. Defaults to '/api/__log'. */
+  /** Override the relay API route path. Defaults to '/api/log-relay'. */
   relayUrl?: string;
   /** Enable verbose DevTools console diagnostics in development. */
   debug?: boolean;
+  /**
+   * Capture uncaught browser errors and unhandled promise rejections and
+   * relay them to the terminal. Defaults to
+   * `LoggerConfig.captureGlobalErrors` (itself `true`), so
+   * `configureLogger({ captureGlobalErrors: false })` on the server turns
+   * it off everywhere; this prop overrides it for one mount.
+   */
+  captureGlobalErrors?: boolean;
 }
 
 /**
@@ -56,11 +67,47 @@ export interface LoggerProviderProps {
  * `security/index.ts` for why this is a bearer-token model rather than a
  * per-payload signature).
  */
-async function mintSessionToken(): Promise<{ token: string; issuedAt: string }> {
+async function mintSessionToken(): Promise<{
+  token: string;
+  issuedAt: string;
+}> {
   const config = getConfig();
   const issuedAt = new Date().toISOString();
   const token = await signSessionToken(config.relaySecret, issuedAt);
   return { token, issuedAt };
+}
+
+/**
+ * Guard against a footgun that cost this library its entire fetch transport.
+ *
+ * The default relay URL used to be `/api/__log`, documented as
+ * `app/api/__log/route.ts`. In the App Router, a folder prefixed with `_` is a
+ * **private folder** — Next opts it and every subfolder out of routing. So the
+ * route handler was never mounted, `POST /api/__log` returned the 404 page,
+ * and the fetch transport silently never worked. That is why the router-
+ * coupled Server Action ended up carrying all client logging, which is what
+ * produced the React state-update errors it was blamed for.
+ *
+ * Nothing about that failure was loud: no build error, no warning, just a
+ * transport that quietly never succeeded. So check it explicitly.
+ */
+function warnIfUnroutableRelayUrl(relayUrl: string): void {
+  if (process.env.NODE_ENV !== "development") return;
+
+  const offending = relayUrl
+    .split("/")
+    .filter(Boolean)
+    .find((segment) => segment.startsWith("_"));
+  if (!offending) return;
+
+  console.warn(
+    `[logger] relayUrl "${relayUrl}" contains the segment "${offending}", which ` +
+      "starts with an underscore. Next.js treats underscore-prefixed folders as " +
+      "private and excludes them from routing, so a route handler there is " +
+      "unreachable and the relay will fall back to the slower Server Action " +
+      "transport. Use a segment without a leading underscore (the default is " +
+      "'/api/log-relay'), or name the folder with the %5F escape.",
+  );
 }
 
 /**
@@ -81,9 +128,11 @@ async function mintSessionToken(): Promise<{ token: string; issuedAt: string }> 
  */
 export async function LoggerProvider({
   children,
-  relayUrl = '/api/__log',
+  relayUrl = "/api/log-relay",
   debug = false,
+  captureGlobalErrors,
 }: LoggerProviderProps) {
+  warnIfUnroutableRelayUrl(relayUrl);
   const { token, issuedAt } = await mintSessionToken();
 
   return (
@@ -94,6 +143,7 @@ export async function LoggerProvider({
         issuedAt={issuedAt}
         debug={debug}
         serverAction={relayLogEntries}
+        captureGlobalErrors={captureGlobalErrors ?? getConfig().captureGlobalErrors}
       />
       {children}
     </>

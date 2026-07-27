@@ -15,8 +15,17 @@
  * correctness or security).
  */
 
+import { getActiveSpanContext, type TraceContext } from './trace-context';
+
 export interface RequestContextData {
   requestId: string;
+  /**
+   * W3C trace context for this request, if the inbound `traceparent` header
+   * carried one. Stored alongside `requestId` rather than in a second
+   * AsyncLocalStorage instance because they have identical lifetimes and
+   * one store means one `getStore()` on the log path.
+   */
+  trace?: TraceContext;
 }
 
 // AsyncLocalStorage import must be conditional — it does not exist in
@@ -37,6 +46,24 @@ export interface RequestContextData {
 let alsInstance: import('node:async_hooks').AsyncLocalStorage<RequestContextData> | null = null;
 
 function initAls(): void {
+  // Browser check FIRST, and it cannot be folded into the `process` check
+  // below: bundlers shim a `process` object into the client bundle, so
+  // `typeof process === 'undefined'` is FALSE in the browser and
+  // `NEXT_RUNTIME` is undefined there — meaning both of the checks below
+  // pass and the browser would go on to attempt the dynamic import. Because
+  // the specifier is deliberately non-static (see the comment below), the
+  // browser treats "node:async_hooks" as a URL and fires a real network
+  // request for it, producing a CORS error in DevTools on every single page
+  // load of every consuming app. The `.catch()` keeps it non-fatal, which is
+  // exactly why it went unnoticed.
+  //
+  // This was masked until the `'use client'` build fix landed: before that,
+  // the chunk holding this module never reached the client bundle at all
+  // (which was itself the bug that broke all browser logging). Fixing that
+  // exposed this. AsyncLocalStorage is only ever needed server-side, so the
+  // browser should never even try.
+  if (typeof window !== 'undefined') return;
+
   if (typeof process === 'undefined' || process.env.NEXT_RUNTIME === 'edge') {
     return;
   }
@@ -72,16 +99,35 @@ function getAls() {
 export function runWithRequestContext<T>(
   requestId: string,
   fn: () => T,
+  trace?: TraceContext,
 ): T {
   const store = getAls();
   if (!store) return fn(); // Edge Runtime / unsupported — degrade gracefully
-  return store.run({ requestId }, fn);
+  return store.run({ requestId, trace }, fn);
 }
 
 /** Read the current request's ID, if any context is active. */
 export function getCurrentRequestId(): string | undefined {
   const store = getAls();
   return store?.getStore()?.requestId;
+}
+
+/**
+ * Trace/span IDs for the current request, for stamping onto a log entry.
+ *
+ * An active OpenTelemetry span wins over the stored `traceparent`: the
+ * header describes the *inbound* request, while the active span reflects
+ * where execution actually is, including spans the app created itself. When
+ * only the header is available the header's span ID is used, which is the
+ * parent span — correct, and the best available answer without an SDK.
+ */
+export function getCurrentTraceIds(): { traceId: string; spanId?: string } | undefined {
+  const fromSpan = getActiveSpanContext();
+  if (fromSpan) return fromSpan;
+
+  const trace = getAls()?.getStore()?.trace;
+  if (!trace) return undefined;
+  return { traceId: trace.traceId, spanId: trace.spanId };
 }
 
 /** Generate a short, URL-safe request ID without external dependencies. */

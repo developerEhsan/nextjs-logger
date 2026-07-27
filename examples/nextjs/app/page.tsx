@@ -1,7 +1,7 @@
 import { log, createLogger } from "@developerehsan/nextjs-logger";
 import { LoggerPlayground } from "./logger-playground";
 
-const pageLog = createLogger({ namespace: "home-page" });
+const pageLog = createLogger({ namespace: "home-page", });
 
 export default async function Home() {
   // A Server Component logging directly in its body — synchronous,

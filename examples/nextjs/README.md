@@ -17,7 +17,7 @@ Open [http://localhost:3000](http://localhost:3000), then watch **the terminal r
 | Feature | File |
 |---|---|
 | Zero-hook client bootstrap | `app/layout.tsx` — `<LoggerProvider>` mounted once |
-| Relay fallback API route | `app/api/__log/route.ts` |
+| Relay fallback API route | `app/api/log-relay/route.ts` |
 | Server Action relay + namespaced logger | `app/actions.ts` |
 | Request-ID correlation | `proxy.ts` + `app/api/orders/route.ts` |
 | Uncaught error auto-logging | `instrumentation.ts` (`onRequestError`) |
